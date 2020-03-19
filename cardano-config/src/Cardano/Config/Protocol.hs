@@ -85,6 +85,7 @@ type TraceConstraints blk =
     , Show blk
     , Show (Header blk)
     , Show (TxId (GenTx blk))
+    , ToObject (Header blk)
     , ToObject (LedgerError blk)
     , ToObject (ValidationErr (BlockProtocol blk))
     )

@@ -27,15 +27,21 @@ import qualified Data.List.NonEmpty as NonEmpty
 import qualified Network.Socket as Socket (SockAddr)
 import           Network.Mux (WithMuxBearer (..), MuxTrace (..))
 
+import           Cardano.Binary (Annotated(..))
 import           Cardano.BM.Data.LogItem (LOContent (..), LogObject (..),
                    mkLOMeta)
 import           Cardano.BM.Tracing
 import           Cardano.BM.Data.Tracer (trStructured, emptyObject, mkObject)
+import qualified Cardano.Crypto.Signing as Crypto
+import qualified Cardano.Chain.Common as Common
 import qualified Cardano.Chain.Block as Block
+import qualified Cardano.Chain.Delegation as Dlg
 
 import           Ouroboros.Consensus.Block
                    (Header, headerPoint,
                     RealPoint, realPointSlot, realPointHash)
+import           Ouroboros.Consensus.Byron.Ledger
+                   (ByronBlock(..), byronHeaderRaw)
 import           Ouroboros.Network.Point (withOrigin)
 import           Ouroboros.Consensus.MiniProtocol.BlockFetch.Server
                    (TraceBlockFetchServerEvent)
@@ -515,7 +521,9 @@ instance (Show peer)
  => Transformable Text IO (WithMuxBearer peer MuxTrace) where
   trTransformer = defaultTextTransformer
 
-instance (Condense (HeaderHash blk), LedgerSupportsProtocol blk)
+instance ( Condense (HeaderHash blk)
+         , LedgerSupportsProtocol blk
+         , ToObject (Header blk))
  => Transformable Text IO (WithTip blk (ChainDB.TraceEvent blk)) where
   -- structure required, will call 'toObject'
   trTransformer StructuredLogging verb tr = trStructured verb tr
@@ -808,6 +816,43 @@ instance ToObject NtN.HandshakeTr where
              , "bearer" .= show b
              , "event" .= show ev ]
 
+instance ( Mock.SimpleCrypto c
+         , Typeable a)
+ => ToObject (Header (Mock.SimpleBlock c a)) where
+  toObject _verb b =
+    mkObject $
+        [ "kind" .= String "SimpleBlockHeader"
+        , "hash" .= condense (blockHash b)
+        , "prevhash" .= condense (blockPrevHash b)
+        , "slotNo" .= condense (blockSlot b)
+        , "blockNo" .= condense (blockNo b) ]
+
+instance ToObject (Header ByronBlock) where
+  toObject _verb b =
+    mkObject $
+        [ "kind" .= String kind
+        , "hash" .= condense (blockHash b)
+        , "prevhash" .= condense (blockPrevHash b)
+        , "slotNo" .= condense (blockSlot b)
+        , "blockNo" .= condense (blockNo b)
+        ] <>
+        case view of
+          Nothing -> []
+          Just (diffic, deleg) ->
+            [ "delegate" .= condense deleg
+            ]
+   where
+     (  kind :: Text
+      , view :: Maybe ( Common.ChainDifficulty
+                      , Crypto.VerificationKey)
+      ) = case byronHeaderRaw b of
+       Block.ABOBBlockHdr h ->
+         ("ByronBlockHeader",
+          Just ( unAnnotated $ Block.aHeaderDifficulty h
+               , Dlg.delegateVK $ Block.delegationCertificate $ Block.headerSignature h))
+       Block.ABOBBoundaryHdr _ ->
+         ("ByronBoundaryHeader", Nothing)
+
 instance (StandardHash blk)
  => ToObject (HeaderEnvelopeError blk) where
   toObject _verb (UnexpectedBlockNo expect act) =
@@ -977,7 +1022,9 @@ instance ToObject SlotNo where
              , "slot" .= toJSON (unSlotNo slot) ]
 
 
-instance (Condense (HeaderHash blk), LedgerSupportsProtocol blk)
+instance ( Condense (HeaderHash blk)
+         , LedgerSupportsProtocol blk
+         , ToObject (Header blk))
  => ToObject (ChainDB.TraceEvent blk) where
   toObject verb (ChainDB.TraceAddBlockEvent ev) = case ev of
     ChainDB.IgnoreBlockOlderThanK pt ->
@@ -1007,12 +1054,14 @@ instance (Condense (HeaderHash blk), LedgerSupportsProtocol blk)
     ChainDB.TrySwitchToAFork pt _ ->
       mkObject [ "kind" .= String "TraceAddBlockEvent.TrySwitchToAFork"
                , "block" .= toObject verb pt ]
-    ChainDB.AddedToCurrentChain _ _ c ->
+    ChainDB.AddedToCurrentChain _ base extended  ->
       mkObject [ "kind" .= String "TraceAddBlockEvent.AddedToCurrentChain"
-               , "newtip" .= showPoint verb (AF.headPoint c) ]
-    ChainDB.SwitchedToAFork _ _ c ->
+               , "newtip" .= showPoint verb (AF.headPoint extended)
+               , "headers" .= toJSON (toObject verb <$> addedHdrsNewChain base extended) ]
+    ChainDB.SwitchedToAFork _ old new ->
       mkObject [ "kind" .= String "TraceAddBlockEvent.SwitchedToAFork"
-               , "newtip" .= showPoint verb (AF.headPoint c) ]
+               , "newtip" .= showPoint verb (AF.headPoint new)
+               , "headers" .= toJSON (toObject verb <$> addedHdrsNewChain old new) ]
     ChainDB.AddBlockValidation ev' -> case ev' of
       ChainDB.InvalidBlock err pt ->
         mkObject [ "kind" .= String "TraceAddBlockEvent.AddBlockValidation.InvalidBlock"
@@ -1047,7 +1096,16 @@ instance (Condense (HeaderHash blk), LedgerSupportsProtocol blk)
                , "blocks" .= map (toObject verb) (NonEmpty.toList pts)
                , "slot" .= toObject verb slot
                , "scheduled" .= n ]
-
+   where
+     addedHdrsNewChain
+       :: (AF.AnchoredFragment (Header blk))
+       -> (AF.AnchoredFragment (Header blk))
+       -> [Header blk]
+     addedHdrsNewChain fro to_ =
+       case AF.intersect fro to_ of
+         Just (_, _, _, s2 :: AF.AnchoredFragment (Header blk)) ->
+           AF.toOldestFirst s2
+         Nothing -> [] -- No sense to do validation here.
   toObject MinimalVerbosity (ChainDB.TraceLedgerReplayEvent _ev) = emptyObject -- no output
   toObject verb (ChainDB.TraceLedgerReplayEvent ev) = case ev of
     LedgerDB.ReplayFromGenesis _replayTo ->
@@ -1394,7 +1452,9 @@ instance (Show peer)
              , "bearer" .= show b
              , "event" .= show ev ]
 
-instance (Condense (HeaderHash blk), LedgerSupportsProtocol blk)
+instance ( Condense (HeaderHash blk)
+         , LedgerSupportsProtocol blk
+         , ToObject (Header blk))
  => ToObject (WithTip blk (ChainDB.TraceEvent blk)) where
   -- example: turn off any tracing of @TraceEvent@s when minimal verbosity level is set
   -- toObject MinimalVerbosity _ = emptyObject -- no output
