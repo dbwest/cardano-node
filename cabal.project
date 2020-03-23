@@ -4,6 +4,7 @@ packages:
     cardano-config
     cardano-node
     cardano-tx-generator
+    cardano-api
 
 package cardano-config
   ghc-options: -Wall -fwarn-redundant-constraints
